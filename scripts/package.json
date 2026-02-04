@@ -1,0 +1,11 @@
+{
+  "name": "ralph-loop-scripts",
+  "version": "3.0.0",
+  "type": "module",
+  "dependencies": {
+    "memorai": "file:../../../memorai"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
