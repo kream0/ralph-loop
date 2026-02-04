@@ -52,7 +52,7 @@ MAX_CYCLES=10
 CONTEXT_THRESHOLD=60
 CYCLE_NUMBER=1
 TOTAL_ITERATIONS_ALL_CYCLES=0
-CONTINUE_FLAG=true  # Set to false on first iteration of new cycles
+CONTINUE_FLAG=false  # First iteration has no prior conversation to continue
 
 # ── Intelligence Detection ──────────────────────────────────────────────────
 if command -v bun &>/dev/null && [[ -d "$SCRIPTS_DIR" ]] && [[ -f "$SCRIPTS_DIR/types.ts" ]]; then
@@ -723,7 +723,7 @@ run_inner_loop() {
             CLAUDE_ARGS+=(--output-format json)
 
             set +e
-            claude "${CLAUDE_ARGS[@]}" > "$TMPFILE" 2>"${RUN_DIR}/iteration-${ITERATION}.stderr"
+            claude "${CLAUDE_ARGS[@]}" </dev/null > "$TMPFILE" 2>"${RUN_DIR}/iteration-${ITERATION}.stderr"
             CLAUDE_EXIT=$?
             set -e
 
@@ -818,7 +818,7 @@ run_inner_loop() {
             echo -e "${CYAN}──── Iteration ${ITER_LABEL}${strat_info} ────────────────────────────────────────${RESET}"
 
             set +e
-            claude "${CLAUDE_ARGS[@]}" 2>&1 | tee "$TMPFILE"
+            claude "${CLAUDE_ARGS[@]}" </dev/null 2>&1 | tee "$TMPFILE"
             CLAUDE_EXIT=$?
             set -e
 
