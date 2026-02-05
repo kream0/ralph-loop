@@ -103,7 +103,7 @@ handoff, multi-cycle) are completely disabled without any indication to the user
 
 ---
 
-### [ROB-2] P2 -- Supervisor mode: handoff data lost without memorai
+### [ROB-2] P2 -- Supervisor mode: handoff data lost without memorai -- DONE
 
 When memorai is not initialized, `save-cycle-handoff.ts` exits with error (line 24-27),
 and `run_save_handoff` in bash silently fails (line 383, `|| true`). The new cycle
@@ -118,6 +118,12 @@ Significantly less efficient.
 
 **Fix (P2):** Consider a filesystem-based fallback for handoff data (e.g., write JSON
 to `.ralph-loop/handoff-cycle-N.json`) when memorai is unavailable.
+
+**Resolution:** Implemented filesystem fallback in both scripts:
+- `save-cycle-handoff.ts`: Added `saveToFilesystem()` that writes to `.ralph-loop/handoff-cycle-N.json`
+  and `.ralph-loop/handoff-latest.json`. Filesystem save happens FIRST (always), memorai is enhancement.
+- `load-cycle-handoff.ts`: Added `loadFromFilesystem()` that reads from filesystem first,
+  falls back to memorai only if filesystem empty. Supports both specific cycle and latest retrieval.
 
 ---
 
@@ -187,7 +193,7 @@ section header.
 
 ---
 
-### [ROB-6] P2 -- Human mode TTY requirement
+### [ROB-6] P2 -- Human mode TTY requirement -- DONE
 
 `claude` CLI in streaming mode (human mode, no `--output-format json`) requires a TTY.
 When piped through `tee` in a non-TTY context (CI/CD, cron, automation script), it may
@@ -200,6 +206,13 @@ hang or produce no output. Agent mode (`--output-format json`) is unaffected.
 **Fix:** Consider adding `--output-format stream-json` support for human mode when
 no TTY is detected. Or document this as a known limitation and recommend `--agent`
 mode for non-interactive contexts.
+
+**Resolution:** Implemented both fixes:
+1. Added `parse_stream_json()` function that parses stream-json output and displays text content
+2. Added TTY detection at runtime - when stdout is not a TTY and `--force-streaming` is not set,
+   automatically switches to stream-json mode
+3. Added `--force-streaming` flag for users who want TTY streaming in non-TTY contexts
+4. Documented limitation in README.md "Known Limitations" section
 
 ---
 
@@ -220,7 +233,7 @@ Banner shows "DRY RUN" mode indicator.
 
 ---
 
-### [FEAT-2] P2 -- `--output-format stream-json` for human mode
+### [FEAT-2] P2 -- `--output-format stream-json` for human mode -- DONE
 
 Use `--output-format stream-json` instead of plain streaming in human mode. This would:
 - Remove the TTY dependency (fixes ROB-6)
@@ -231,6 +244,14 @@ Use `--output-format stream-json` instead of plain streaming in human mode. This
 flag like `--structured-human` or auto-detected when no TTY is present.
 
 **Where:** `ralph-loop.sh:811-837` (human mode execution block).
+
+**Resolution:** Implemented auto-detection approach:
+- Added `parse_stream_json()` function (lines 511-567) that parses stream-json JSONL output
+  and displays text content, similar to agent mode but with streaming display
+- Added TTY detection in human mode execution (lines 1008-1033)
+- When no TTY detected (and `--force-streaming` not set), automatically uses stream-json
+- Promise detection works in both modes (checks JSONL result field and content blocks)
+- Added `--force-streaming` flag for users who want TTY behavior regardless
 
 ---
 
@@ -320,7 +341,7 @@ Related to ROB-1.
 
 ## Documentation
 
-### [DOC-1] P2 -- Document `--continue` fix for cycle 1
+### [DOC-1] P2 -- Document `--continue` fix for cycle 1 -- DONE
 
 The bug where `--continue` was passed on the first iteration of cycle 1 (no prior
 conversation) has been fixed. `CONTINUE_FLAG` is now initialized to `false` (line 55)
@@ -329,6 +350,9 @@ in a CHANGELOG or release notes.
 
 **Where:** `ralph-loop.sh:55` (`CONTINUE_FLAG=false`), `ralph-loop.sh:719`
 (set to true after first iteration).
+
+**Resolution:** Documented in README.md Changelog section under "Recent Fixes (v3.0.1)"
+with full explanation of before/after behavior.
 
 ---
 
@@ -345,12 +369,16 @@ Documentation may still be useful to explain what the token fields include.
 
 ---
 
-### [DOC-3] P2 -- Document human mode TTY limitation
+### [DOC-3] P2 -- Document human mode TTY limitation -- DONE
 
 Add a note in README.md that human mode requires a TTY and is not suitable for CI/CD
 or non-interactive contexts. Recommend `--agent` mode for those use cases.
 
 **Where:** `README.md`, Usage section or a new "Known Limitations" section.
+
+**Resolution:** Added "Known Limitations" section in README.md with "Human Mode TTY Requirement"
+subsection. Explains the issue, lists affected scenarios (CI/CD, cron, pipes), and recommends
+`--agent` mode for non-interactive contexts with example command.
 
 ---
 
@@ -360,18 +388,14 @@ or non-interactive contexts. Recommend `--agent` mode for those use cases.
 |----------|------|------------|----------|---------------|-------|
 | P0       | 0    | 0          | 0        | 0             | 0     |
 | P1       | 0 (2 done) | 0 (3 done) | 0 (2 done) | 0         | 0 (7 done) |
-| P2       | 0 (1 done) | 2 (1 done) | 1 (5 done) | 2 (1 code fix) | 5 remaining |
-| **Total**| **0**| **2**      | **1**    | **2**         | **5 remaining**|
+| P2       | 0 (1 done) | 0 (3 done) | 0 (6 done) | 0 (3 done) | 0 (13 done) |
+| **Total**| **0**| **0**      | **0**    | **0**         | **0 remaining**|
 
-### Completed (15 items)
+### Completed (20 items)
 - BUG-1, BUG-2, BUG-3
-- ROB-1, ROB-3, ROB-4, ROB-5
-- FEAT-1, FEAT-3, FEAT-4, FEAT-5, FEAT-6, FEAT-7, FEAT-8
-- DOC-2 (code fix only)
+- ROB-1, ROB-2, ROB-3, ROB-4, ROB-5, ROB-6
+- FEAT-1, FEAT-2, FEAT-3, FEAT-4, FEAT-5, FEAT-6, FEAT-7, FEAT-8
+- DOC-1, DOC-2, DOC-3
 
-### Remaining (5 items)
-- ROB-2: Filesystem fallback for handoff without memorai
-- ROB-6: Human mode TTY requirement
-- FEAT-2: Stream-json for human mode
-- DOC-1: Document --continue fix
-- DOC-3: Document TTY limitation
+### Remaining (0 items)
+All items complete!
