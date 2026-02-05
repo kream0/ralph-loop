@@ -42,6 +42,8 @@ SESSION_ID=""
 CURRENT_STRATEGY="explore"
 STUCK_COUNT=0
 ERROR_COUNT=0
+API_ERROR_COUNT=0
+LAST_API_ERROR=""
 CONTEXT_PCT=0
 LAST_ANALYSIS_JSON=""
 LAST_STRATEGY_JSON=""
@@ -53,6 +55,14 @@ CONTEXT_THRESHOLD=60
 CYCLE_NUMBER=1
 TOTAL_ITERATIONS_ALL_CYCLES=0
 CONTINUE_FLAG=false  # First iteration has no prior conversation to continue
+
+# ── User Override Flags ────────────────────────────────────────────────────
+NO_INTELLIGENCE_FLAG=false
+DRY_RUN=false
+FORCE_STREAMING=false
+
+# ── Child Process Tracking ──────────────────────────────────────────────────
+CLAUDE_PID=""
 
 # ── Intelligence Detection ──────────────────────────────────────────────────
 if command -v bun &>/dev/null && [[ -d "$SCRIPTS_DIR" ]] && [[ -f "$SCRIPTS_DIR/types.ts" ]]; then
@@ -82,6 +92,11 @@ Intelligence Layer Options (requires bun + scripts/):
   --max-cycles <N>                Max cycles in supervisor mode (default: 10)
   --context-threshold <N>         Context % that triggers new cycle (default: 60)
   --nudge <TEXT>                  Write a nudge for next iteration, then exit
+  --no-intelligence               Disable intelligence layer (for debugging/benchmarking)
+  --dry-run                       Show what would be sent to claude without invoking it
+
+Output Options:
+  --force-streaming               Force TTY streaming mode even without a TTY (human mode)
 
 Permission modes:
   Default: --permission-mode acceptEdits (auto-accepts file edits)
@@ -104,6 +119,7 @@ Examples:
   ./ralph-loop.sh "Refactor the cache layer" --agent -m 10
   ./ralph-loop.sh "Build the feature" --agent --supervisor --max-cycles 5
   ./ralph-loop.sh --nudge "Focus on the API endpoints next"
+  ./ralph-loop.sh "Test the auth flow" --dry-run
 USAGE
 }
 
@@ -165,6 +181,18 @@ while [[ $# -gt 0 ]]; do
             echo "Nudge written to .ralph-loop/nudge.md"
             exit 0
             ;;
+        --no-intelligence)
+            NO_INTELLIGENCE_FLAG=true
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --force-streaming)
+            FORCE_STREAMING=true
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -204,6 +232,24 @@ fi
 if ! [[ "$CONTEXT_THRESHOLD" =~ ^[0-9]+$ ]]; then
     echo "Error: --context-threshold must be a positive integer" >&2
     exit 1
+fi
+
+# ── Apply --no-intelligence override (FEAT-3) ──────────────────────────────
+# If user explicitly requested no intelligence layer, override the auto-detection
+if [[ "$NO_INTELLIGENCE_FLAG" == true ]]; then
+    INTELLIGENCE_AVAILABLE=false
+fi
+
+# ── Supervisor Mode Warning (ROB-1/FEAT-8) ─────────────────────────────────
+# If --supervisor was requested but intelligence layer is unavailable, warn user
+if [[ "$SUPERVISOR_MODE" == true && "$INTELLIGENCE_AVAILABLE" != true ]]; then
+    if [[ "$AGENT_MODE" == true ]]; then
+        # In agent mode, emit structured warning that can be captured in status
+        echo "[WARN] --supervisor requires bun + scripts/ -- falling back to basic mode"
+    else
+        # In human mode, emit to stderr with formatting
+        echo -e "${YELLOW}WARNING: --supervisor requires bun + scripts/ -- falling back to basic mode${RESET}" >&2
+    fi
 fi
 
 # ── TMPFILE Creation (after arg parsing so --help/--nudge don't create it) ─
@@ -256,9 +302,12 @@ SESSION_ID=$(generate_session_id)
 # ── Nudge Reader ────────────────────────────────────────────────────────────
 read_and_consume_nudge() {
     local nudge_file=".ralph-loop/nudge.md"
-    if [[ -f "$nudge_file" ]]; then
-        cat "$nudge_file"
-        rm -f "$nudge_file"
+    local consumed_file=".ralph-loop/nudge.consumed.md"
+    # Atomic consumption: mv is atomic on same filesystem, so a concurrent
+    # write creates a new nudge.md that is preserved (fixes ROB-3/FEAT-6)
+    if mv "$nudge_file" "$consumed_file" 2>/dev/null; then
+        cat "$consumed_file"
+        rm -f "$consumed_file"
     fi
 }
 
@@ -417,6 +466,106 @@ build_state_json() {
         }'
 }
 
+# ── Dry Run Output ───────────────────────────────────────────────────────────
+# Prints what would be sent to claude without invoking it (FEAT-1)
+print_dry_run_info() {
+    local prompt="$1"
+    shift
+    local args=("$@")
+
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "${CYAN}  ${BOLD}DRY RUN${RESET}${CYAN} — Iteration ${ITERATION}${RESET}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo ""
+    echo -e "${BOLD}Claude Arguments:${RESET}"
+    echo "  claude ${args[*]}"
+    echo ""
+    echo -e "${BOLD}Strategy:${RESET} ${CURRENT_STRATEGY}"
+    echo -e "${BOLD}Continue Flag:${RESET} ${CONTINUE_FLAG}"
+    echo -e "${BOLD}Intelligence Available:${RESET} ${INTELLIGENCE_AVAILABLE}"
+    echo ""
+    echo -e "${BOLD}Full Prompt:${RESET}"
+    echo -e "${DIM}────────────────────────────────────────────────────────────${RESET}"
+    echo "$prompt"
+    echo -e "${DIM}────────────────────────────────────────────────────────────${RESET}"
+    echo ""
+
+    # Show strategy JSON if available
+    if [[ -n "${LAST_STRATEGY_JSON:-}" && "$LAST_STRATEGY_JSON" != "{}" ]]; then
+        echo -e "${BOLD}Strategy JSON:${RESET}"
+        echo "$LAST_STRATEGY_JSON" | jq . 2>/dev/null || echo "$LAST_STRATEGY_JSON"
+        echo ""
+    fi
+
+    # Show analysis JSON if available
+    if [[ -n "${LAST_ANALYSIS_JSON:-}" && "$LAST_ANALYSIS_JSON" != "{}" ]]; then
+        echo -e "${BOLD}Last Analysis JSON:${RESET}"
+        echo "$LAST_ANALYSIS_JSON" | jq . 2>/dev/null || echo "$LAST_ANALYSIS_JSON"
+        echo ""
+    fi
+}
+
+# ── Stream-JSON Parser for Human Mode (ROB-6/FEAT-2) ────────────────────────
+# Parses stream-json output and displays text content, similar to agent mode but streaming
+# Returns text via stdout, stores full output in the file passed as $1
+parse_stream_json() {
+    local output_file="$1"
+    local full_text=""
+
+    # Read stream-json line by line
+    while IFS= read -r line; do
+        # Save raw line to output file for later promise detection
+        printf '%s\n' "$line" >> "$output_file"
+
+        # Skip empty lines
+        [[ -z "$line" ]] && continue
+
+        # Parse JSON line - extract text content from assistant messages
+        local msg_type content_type text_content
+        msg_type=$(printf '%s' "$line" | jq -r '.type // ""' 2>/dev/null) || continue
+
+        case "$msg_type" in
+            "assistant")
+                # Extract text from content blocks
+                text_content=$(printf '%s' "$line" | jq -r '.message.content[]? | select(.type == "text") | .text // ""' 2>/dev/null) || true
+                if [[ -n "$text_content" ]]; then
+                    printf '%s' "$text_content"
+                    full_text+="$text_content"
+                fi
+                ;;
+            "content_block_delta")
+                # Streaming delta - extract text delta
+                text_content=$(printf '%s' "$line" | jq -r '.delta.text // ""' 2>/dev/null) || true
+                if [[ -n "$text_content" ]]; then
+                    printf '%s' "$text_content"
+                    full_text+="$text_content"
+                fi
+                ;;
+            "content_block_start")
+                # Could be start of a new text block
+                text_content=$(printf '%s' "$line" | jq -r '.content_block.text // ""' 2>/dev/null) || true
+                if [[ -n "$text_content" ]]; then
+                    printf '%s' "$text_content"
+                    full_text+="$text_content"
+                fi
+                ;;
+            "result")
+                # Final result message - extract result text if present
+                text_content=$(printf '%s' "$line" | jq -r '.result // ""' 2>/dev/null) || true
+                if [[ -n "$text_content" && "$text_content" != "null" ]]; then
+                    # Only print if we haven't already streamed it
+                    if [[ -z "$full_text" ]]; then
+                        printf '%s' "$text_content"
+                    fi
+                fi
+                ;;
+        esac
+    done
+
+    # Ensure final newline
+    echo ""
+}
+
 # ── Prompt Builder ──────────────────────────────────────────────────────────
 build_prompt() {
     local iter="$1"
@@ -431,14 +580,15 @@ build_prompt() {
         iter_label="iteration ${iter}"
     fi
 
+    # Read nudge BEFORE intelligence check so it works in basic mode too (ROB-5/FEAT-7)
+    local nudge
+    nudge=$(read_and_consume_nudge)
+
     # ── Intelligence-enhanced prompt ────────────────────────────────────
     if [[ "$INTELLIGENCE_AVAILABLE" == true ]]; then
         local state_json
         state_json=$(build_state_json)
 
-        # Read nudge (consumed after reading)
-        local nudge
-        nudge=$(read_and_consume_nudge)
 
         # Get strategy (use last analysis if available, else empty)
         local analysis_for_strategy="${LAST_ANALYSIS_JSON:-"{}"}"
@@ -519,6 +669,11 @@ You are in ${iter_label} of a Ralph loop. Continue working on your task. Check y
 PROMPT
         fi
     fi
+
+    # Append nudge if present (basic mode support - ROB-5/FEAT-7)
+    if [[ -n "$nudge" ]]; then
+        printf "\n## Nudge from User\n%s\n" "$nudge"
+    fi
 }
 
 # ── Status JSON Writer (Leash integration) ────────────────────────────────
@@ -545,6 +700,8 @@ update_status_json() {
         --arg session_id "$SESSION_ID" \
         --arg strategy "$CURRENT_STRATEGY" \
         --argjson error_count "$ERROR_COUNT" \
+        --argjson api_error_count "$API_ERROR_COUNT" \
+        --arg last_api_error "$LAST_API_ERROR" \
         --argjson stuck_count "$STUCK_COUNT" \
         --argjson context_pct "$CONTEXT_PCT" \
         --argjson intelligence_available "$INTELLIGENCE_AVAILABLE" \
@@ -567,6 +724,8 @@ update_status_json() {
           session_id: $session_id,
           strategy: $strategy,
           error_count: $error_count,
+          api_error_count: $api_error_count,
+          last_api_error: $last_api_error,
           stuck_count: $stuck_count,
           context_pct: $context_pct,
           intelligence_available: $intelligence_available,
@@ -622,6 +781,9 @@ cleanup() {
 trap cleanup EXIT
 
 handle_interrupt() {
+    # Kill child claude process if running (prevents orphaned processes)
+    [[ -n "$CLAUDE_PID" ]] && kill "$CLAUDE_PID" 2>/dev/null
+
     # Generate summary on interrupt
     run_generate_summary "cancelled" 2>/dev/null || true
 
@@ -665,6 +827,9 @@ if [[ "$AGENT_MODE" != true ]]; then
         echo -e "  ${BOLD}Intel:${RESET}   ${DIM}basic mode (bun/scripts not found)${RESET}"
     fi
     echo -e "  ${BOLD}Session:${RESET} ${DIM}${SESSION_ID}${RESET}"
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "  ${BOLD}Mode:${RESET}    ${YELLOW}DRY RUN — will not invoke claude${RESET}"
+    fi
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
     echo ""
 fi
@@ -718,13 +883,30 @@ run_inner_loop() {
         # After first iteration of a cycle, always use --continue
         CONTINUE_FLAG=true
 
+        # ── Dry Run Mode: Print info and exit ────────────────────────────────
+        if [[ "$DRY_RUN" == true ]]; then
+            # Add output format for completeness in dry run display
+            local display_args=("${CLAUDE_ARGS[@]}")
+            if [[ "$AGENT_MODE" == true ]]; then
+                display_args+=(--output-format json)
+            fi
+            print_dry_run_info "$FULL_PROMPT" "${display_args[@]}"
+            echo -e "${GREEN}[DRY RUN] Exiting after showing iteration ${ITERATION} configuration.${RESET}"
+            echo -e "${DIM}Run without --dry-run to actually invoke claude.${RESET}"
+            return 0
+        fi
+
         # ── Execute: Agent Mode ─────────────────────────────────────────────
         if [[ "$AGENT_MODE" == true ]]; then
             CLAUDE_ARGS+=(--output-format json)
 
             set +e
-            claude "${CLAUDE_ARGS[@]}" </dev/null > "$TMPFILE" 2>"${RUN_DIR}/iteration-${ITERATION}.stderr"
+            # Run claude in background and track PID for signal handling (ROB-4/FEAT-5)
+            claude "${CLAUDE_ARGS[@]}" </dev/null > "$TMPFILE" 2>"${RUN_DIR}/iteration-${ITERATION}.stderr" &
+            CLAUDE_PID=$!
+            wait $CLAUDE_PID
             CLAUDE_EXIT=$?
+            CLAUDE_PID=""
             set -e
 
             # Save full JSON log
@@ -734,7 +916,7 @@ run_inner_loop() {
             RESULT_TEXT=$(jq -r '.result // ""' "$TMPFILE" 2>/dev/null || echo "")
             IS_ERROR=$(jq -r '.is_error // false' "$TMPFILE" 2>/dev/null || echo "true")
             ITER_COST=$(jq -r '.total_cost_usd // 0' "$TMPFILE" 2>/dev/null || echo "0")
-            ITER_INPUT=$(jq -r '.usage.input_tokens // 0' "$TMPFILE" 2>/dev/null || echo "0")
+            ITER_INPUT=$(jq -r '(.usage.input_tokens // 0) + (.usage.cache_creation_input_tokens // 0) + (.usage.cache_read_input_tokens // 0)' "$TMPFILE" 2>/dev/null || echo "0")
             ITER_OUTPUT=$(jq -r '.usage.output_tokens // 0' "$TMPFILE" 2>/dev/null || echo "0")
 
             # Accumulate totals
@@ -755,6 +937,11 @@ run_inner_loop() {
             if [[ "$IS_ERROR" == "true" ]] || [[ "$CLAUDE_EXIT" -ne 0 ]]; then
                 STATUS="ERROR"
                 SUMMARY=$(printf '%s' "$RESULT_TEXT" | head -c 200 | tr '\n' ' ')
+                # Track API-level errors (BUG-1/FEAT-4)
+                if [[ "$IS_ERROR" == "true" ]]; then
+                    API_ERROR_COUNT=$((API_ERROR_COUNT + 1))
+                    LAST_API_ERROR=$(printf '%s' "$RESULT_TEXT" | head -c 500 | tr '\n' ' ')
+                fi
             elif [[ "$PROMISE_FOUND" == "DETECTED" ]]; then
                 STATUS="COMPLETE"
             else
@@ -765,7 +952,8 @@ run_inner_loop() {
             if [[ "$STATUS" != "ERROR" ]]; then
                 SUMMARY=$(printf '%s' "$RESULT_TEXT" | grep -oP '^\[STATUS\]\s*\K.*' | tail -1 || true)
                 if [[ -z "$SUMMARY" ]]; then
-                    SUMMARY=$(printf '%s' "$RESULT_TEXT" | sed '/^$/d' | tail -1 | head -c 150 | tr '\n' ' ')
+                    # Strip promise tags and empty lines, then take the last meaningful line
+                    SUMMARY=$(printf '%s' "$RESULT_TEXT" | grep -v '<promise>.*</promise>' | sed '/^$/d' | tail -1 | head -c 150 | tr '\n' ' ')
                 fi
             fi
 
@@ -817,13 +1005,53 @@ run_inner_loop() {
             fi
             echo -e "${CYAN}──── Iteration ${ITER_LABEL}${strat_info} ────────────────────────────────────────${RESET}"
 
+            # ── TTY Detection (ROB-6/FEAT-2) ───────────────────────────────────
+            # If stdout is not a TTY (piped, CI/CD, etc.) and --force-streaming is not set,
+            # use stream-json output format to avoid hanging
+            local USE_STREAM_JSON=false
+            if [[ ! -t 1 && "$FORCE_STREAMING" != true ]]; then
+                USE_STREAM_JSON=true
+                # Check jq dependency for stream-json parsing
+                if ! command -v jq &>/dev/null; then
+                    echo "WARNING: No TTY detected and jq not available. Output may hang." >&2
+                    USE_STREAM_JSON=false
+                fi
+            fi
+
             set +e
-            claude "${CLAUDE_ARGS[@]}" </dev/null 2>&1 | tee "$TMPFILE"
-            CLAUDE_EXIT=$?
+            if [[ "$USE_STREAM_JSON" == true ]]; then
+                # Non-TTY mode: use stream-json and parse it
+                # Clear TMPFILE first since parse_stream_json appends to it
+                > "$TMPFILE"
+                claude "${CLAUDE_ARGS[@]}" --output-format stream-json </dev/null 2>&1 | parse_stream_json "$TMPFILE"
+                CLAUDE_EXIT=${PIPESTATUS[0]}
+            else
+                # TTY mode: use normal streaming output
+                claude "${CLAUDE_ARGS[@]}" </dev/null 2>&1 | tee "$TMPFILE"
+                CLAUDE_EXIT=$?
+            fi
             set -e
 
             # Check for completion promise
-            if grep -q "<promise>${COMPLETION_PROMISE}</promise>" "$TMPFILE" 2>/dev/null; then
+            # For stream-json mode, we need to search the raw JSONL for the promise in result text
+            local PROMISE_DETECTED=false
+            if [[ "$USE_STREAM_JSON" == true ]]; then
+                # Extract result text from stream-json and check for promise
+                if grep -o '"result":"[^"]*"' "$TMPFILE" 2>/dev/null | grep -q "<promise>${COMPLETION_PROMISE}</promise>"; then
+                    PROMISE_DETECTED=true
+                fi
+                # Also check content blocks for the promise
+                if grep -q "<promise>${COMPLETION_PROMISE}</promise>" "$TMPFILE" 2>/dev/null; then
+                    PROMISE_DETECTED=true
+                fi
+            else
+                # Normal TTY mode - check TMPFILE directly
+                if grep -q "<promise>${COMPLETION_PROMISE}</promise>" "$TMPFILE" 2>/dev/null; then
+                    PROMISE_DETECTED=true
+                fi
+            fi
+
+            if [[ "$PROMISE_DETECTED" == true ]]; then
                 run_generate_summary "promise" 2>/dev/null || true
                 echo ""
                 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"

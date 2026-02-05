@@ -4,10 +4,18 @@
  *
  * Saves comprehensive handoff data to Memorai before a cycle ends.
  * This data is used to restore context when a new cycle starts.
+ *
+ * Includes filesystem-based fallback when memorai is unavailable.
  */
 
 import { MemoraiClient, databaseExists } from "memorai";
+import { mkdir, writeFile } from "fs/promises";
+import { existsSync } from "fs";
+import { join } from "path";
 import type { HandoffData } from "./types";
+
+// Filesystem fallback directory (relative to cwd)
+const HANDOFF_DIR = ".ralph-loop";
 
 interface HandoffInput {
   session_id: string;
@@ -20,20 +28,46 @@ interface HandoffInput {
   key_learnings?: string[];
 }
 
-async function saveHandoff(input: HandoffInput): Promise<void> {
-  if (!databaseExists()) {
-    console.error("Memorai database not found. Run: memorai init");
-    process.exit(1);
-  }
-
-  let client: MemoraiClient;
+/**
+ * Save handoff data to filesystem as a fallback.
+ * This ensures data is preserved even when memorai is unavailable.
+ */
+async function saveToFilesystem(handoff: HandoffData): Promise<boolean> {
   try {
-    client = new MemoraiClient();
-  } catch (error) {
-    console.error("Failed to initialize Memorai client:", error);
-    process.exit(1);
-  }
+    const handoffDir = join(process.cwd(), HANDOFF_DIR);
 
+    // Create directory if it doesn't exist
+    if (!existsSync(handoffDir)) {
+      await mkdir(handoffDir, { recursive: true });
+    }
+
+    const filename = `handoff-cycle-${handoff.cycle_number}.json`;
+    const filepath = join(handoffDir, filename);
+
+    // Write handoff data with full context
+    const fileData = {
+      ...handoff,
+      _metadata: {
+        version: "1.0",
+        source: "filesystem-fallback",
+        saved_at: new Date().toISOString(),
+      },
+    };
+
+    await writeFile(filepath, JSON.stringify(fileData, null, 2), "utf-8");
+
+    // Also write a "latest" pointer file for easy retrieval
+    const latestPath = join(handoffDir, "handoff-latest.json");
+    await writeFile(latestPath, JSON.stringify(fileData, null, 2), "utf-8");
+
+    return true;
+  } catch (error) {
+    console.error("Filesystem fallback save failed:", error);
+    return false;
+  }
+}
+
+async function saveHandoff(input: HandoffInput): Promise<void> {
   const handoff: HandoffData = {
     session_id: input.session_id,
     cycle_number: input.cycle_number,
@@ -46,7 +80,10 @@ async function saveHandoff(input: HandoffInput): Promise<void> {
     saved_at: new Date().toISOString(),
   };
 
-  // Build handoff content
+  // ALWAYS save to filesystem first (fallback that works without memorai)
+  const filesystemSaved = await saveToFilesystem(handoff);
+
+  // Build handoff content for memorai
   const content = `## Cycle ${handoff.cycle_number} Handoff
 
 ### Original Objective
@@ -77,47 +114,64 @@ ${handoff.key_learnings.length > 0
 - Saved at: ${handoff.saved_at}
 `;
 
-  // Store in Memorai with specific tags for retrieval
-  try {
-    await client.store({
-      category: "notes",
-      title: `Ralph Cycle ${handoff.cycle_number} Handoff`,
-      content: content,
-      tags: [
-        "ralph",
-        "cycle-handoff",
-        `cycle-${handoff.cycle_number}`,
-        handoff.session_id,
-      ],
-      importance: 9, // High importance for handoffs
-      sessionId: handoff.session_id,
-    });
+  // Try to save to Memorai if available (enhancement, not required)
+  let memoraiSaved = false;
+  if (databaseExists()) {
+    let client: MemoraiClient;
+    try {
+      client = new MemoraiClient();
 
-    // Also store structured JSON for programmatic access
-    await client.store({
-      category: "notes",
-      title: `Ralph Cycle ${handoff.cycle_number} Handoff Data (JSON)`,
-      content: JSON.stringify(handoff, null, 2),
-      tags: [
-        "ralph",
-        "cycle-handoff-json",
-        `cycle-${handoff.cycle_number}`,
-        handoff.session_id,
-      ],
-      importance: 8,
-      sessionId: handoff.session_id,
-    });
+      await client.store({
+        category: "notes",
+        title: `Ralph Cycle ${handoff.cycle_number} Handoff`,
+        content: content,
+        tags: [
+          "ralph",
+          "cycle-handoff",
+          `cycle-${handoff.cycle_number}`,
+          handoff.session_id,
+        ],
+        importance: 9, // High importance for handoffs
+        sessionId: handoff.session_id,
+      });
 
+      // Also store structured JSON for programmatic access
+      await client.store({
+        category: "notes",
+        title: `Ralph Cycle ${handoff.cycle_number} Handoff Data (JSON)`,
+        content: JSON.stringify(handoff, null, 2),
+        tags: [
+          "ralph",
+          "cycle-handoff-json",
+          `cycle-${handoff.cycle_number}`,
+          handoff.session_id,
+        ],
+        importance: 8,
+        sessionId: handoff.session_id,
+      });
+
+      memoraiSaved = true;
+    } catch (error) {
+      console.error("Memorai save failed (using filesystem fallback):", error);
+    }
+  }
+
+  // Success if at least filesystem save worked
+  if (filesystemSaved || memoraiSaved) {
     console.log(
       JSON.stringify({
         success: true,
         session_id: handoff.session_id,
         cycle: handoff.cycle_number,
         saved_at: handoff.saved_at,
+        storage: {
+          filesystem: filesystemSaved,
+          memorai: memoraiSaved,
+        },
       })
     );
-  } catch (error) {
-    console.error("Failed to save handoff:", error);
+  } else {
+    console.error("Failed to save handoff to any storage");
     process.exit(1);
   }
 }
@@ -129,16 +183,20 @@ async function collectSessionData(sessionId: string): Promise<{
   next_actions: string[];
   key_learnings: string[];
 }> {
-  if (!databaseExists()) {
-    return {
-      accomplishments: [],
-      blockers: [],
-      next_actions: [],
-      key_learnings: [],
-    };
-  }
+  const emptyResult = {
+    accomplishments: [],
+    blockers: [],
+    next_actions: [],
+    key_learnings: [],
+  };
 
-  const client = new MemoraiClient();
+  // Wrap entire memorai access in try-catch for robustness
+  try {
+    if (!databaseExists()) {
+      return emptyResult;
+    }
+
+    const client = new MemoraiClient();
 
   // Helper to normalize search results (handles both array and {results: []} formats)
   const normalizeResults = (results: any) =>
@@ -186,7 +244,12 @@ async function collectSessionData(sessionId: string): Promise<{
     }
   }
 
-  return { accomplishments, blockers, next_actions, key_learnings };
+    return { accomplishments, blockers, next_actions, key_learnings };
+  } catch (error) {
+    // Memorai unavailable - return empty result (filesystem fallback still works)
+    console.error("Memorai access failed in collectSessionData:", error);
+    return emptyResult;
+  }
 }
 
 // Main execution

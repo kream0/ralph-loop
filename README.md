@@ -29,6 +29,13 @@ A standalone bash script that runs Claude Code in an autonomous [Ralph Wiggum](h
 | `--context-threshold N` | Context % that triggers new cycle | 60 |
 | `--nudge "TEXT"` | Write a nudge for the next iteration, then exit | — |
 
+### Debugging Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--dry-run` | Test prompt building without invoking Claude. Shows the full prompt that would be sent, strategy selection, and all configuration. Useful for debugging prompt construction. | off |
+| `--no-intelligence` | Disable the intelligence layer even if `bun` and `scripts/` are available. Forces basic loop mode for debugging or benchmarking. | off |
+
 ### Examples
 
 ```bash
@@ -49,6 +56,12 @@ A standalone bash script that runs Claude Code in an autonomous [Ralph Wiggum](h
 
 # Send a nudge to a running loop (from another terminal)
 ./ralph-loop.sh --nudge "Focus on the API endpoints next"
+
+# Debugging: see what prompt would be sent without invoking Claude
+./ralph-loop.sh "Fix the bug" --dry-run
+
+# Debugging: force basic loop mode (disable intelligence layer)
+./ralph-loop.sh "Fix the bug" --no-intelligence -m 5
 ```
 
 ## How It Works
@@ -193,6 +206,23 @@ The script includes defensive measures to prevent silent failures:
 - **Agent mode [STATUS] line resilience:** If Claude does not emit a `[STATUS]` line, the script falls back to extracting the last non-empty line of output instead of crashing.
 - **set +e around claude calls:** The `claude` CLI invocation is wrapped in `set +e` / `set -e` so that non-zero exit codes (e.g., from timeouts or API errors) do not terminate the loop prematurely.
 
+## Known Limitations
+
+### Human Mode TTY Requirement
+
+Human mode (the default, non-agent mode) relies on the `claude` CLI's streaming output, which requires a TTY (terminal). When running in non-interactive contexts without a TTY:
+
+- **CI/CD pipelines** — may hang or produce no output
+- **Cron jobs** — streaming output may not work correctly
+- **Piped through other tools** — TTY detection may fail
+
+**Recommendation:** Use `--agent` mode for CI/CD, automation scripts, or any non-interactive context. Agent mode uses `--output-format json` which does not require a TTY.
+
+```bash
+# In CI/CD or automation scripts, always use --agent
+./ralph-loop.sh "Run the tests" --agent -m 10
+```
+
 ## Exit Codes
 
 | Code | Meaning |
@@ -247,3 +277,21 @@ The core idea (by Geoffrey Huntley): feed the same prompt to an AI agent in a lo
 ```
 prompt → claude works → exits → same prompt again → sees previous work → iterates → done
 ```
+
+## Changelog
+
+### Recent Fixes
+
+**--continue flag on first iteration (v3.0.1)**
+
+Fixed a bug where `--continue` was incorrectly passed to `claude` on the first iteration of cycle 1. The `--continue` flag tells Claude to resume a previous session, but on the very first iteration there is no prior session to continue.
+
+- **Before:** `CONTINUE_FLAG` was not explicitly initialized, causing `--continue` to potentially be passed on iteration 1
+- **After:** `CONTINUE_FLAG` is now initialized to `false` and only set to `true` after the first iteration completes
+
+This fix ensures Claude starts with a fresh session on the first iteration and only uses `--continue` for subsequent iterations where there is actual prior context to resume.
+
+### New Features (v3.0.1)
+
+- **`--dry-run`** — Test prompt building without invoking Claude. Displays the full prompt, strategy selection, and configuration that would be used.
+- **`--no-intelligence`** — Disable the intelligence layer even when `bun` and `scripts/` are available. Useful for debugging or comparing basic vs. intelligent mode behavior.

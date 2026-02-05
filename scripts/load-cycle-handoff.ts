@@ -4,10 +4,18 @@
  *
  * Loads the most recent handoff data from Memorai for a given session.
  * Used when starting a new cycle to restore context.
+ *
+ * Includes filesystem-based fallback when memorai is unavailable.
  */
 
 import { MemoraiClient, databaseExists } from "memorai";
+import { readFile, readdir } from "fs/promises";
+import { existsSync } from "fs";
+import { join } from "path";
 import type { HandoffData } from "./types";
+
+// Filesystem fallback directory (relative to cwd)
+const HANDOFF_DIR = ".ralph-loop";
 
 interface LoadInput {
   session_id: string;
@@ -19,13 +27,99 @@ interface LoadOutput {
   handoff?: HandoffData;
   formatted_context?: string;
   error?: string;
+  source?: "filesystem" | "memorai";
+}
+
+/**
+ * Load handoff data from filesystem fallback.
+ * Returns null if not found or on error.
+ */
+async function loadFromFilesystem(
+  sessionId: string,
+  cycleNumber?: number
+): Promise<HandoffData | null> {
+  try {
+    const handoffDir = join(process.cwd(), HANDOFF_DIR);
+
+    if (!existsSync(handoffDir)) {
+      return null;
+    }
+
+    let filepath: string;
+
+    if (cycleNumber !== undefined) {
+      // Load specific cycle
+      filepath = join(handoffDir, `handoff-cycle-${cycleNumber}.json`);
+    } else {
+      // Try to load latest first
+      const latestPath = join(handoffDir, "handoff-latest.json");
+      if (existsSync(latestPath)) {
+        filepath = latestPath;
+      } else {
+        // Fall back to finding the highest cycle number
+        const files = await readdir(handoffDir);
+        const cycleFiles = files
+          .filter((f) => f.match(/^handoff-cycle-\d+\.json$/))
+          .map((f) => ({
+            name: f,
+            cycle: parseInt(f.match(/handoff-cycle-(\d+)\.json/)?.[1] || "0"),
+          }))
+          .sort((a, b) => b.cycle - a.cycle);
+
+        if (cycleFiles.length === 0) {
+          return null;
+        }
+
+        filepath = join(handoffDir, cycleFiles[0].name);
+      }
+    }
+
+    if (!existsSync(filepath)) {
+      return null;
+    }
+
+    const content = await readFile(filepath, "utf-8");
+    const data = JSON.parse(content);
+
+    // Optionally filter by session_id if it matches
+    // (filesystem fallback may not always have session filtering)
+    if (data.session_id && data.session_id !== sessionId) {
+      // Session mismatch - this handoff is from a different session
+      // Still return it for now (session_id in filesystem is informational)
+    }
+
+    // Extract HandoffData (strip _metadata if present)
+    const { _metadata, ...handoff } = data;
+
+    return handoff as HandoffData;
+  } catch (error) {
+    console.error("Filesystem fallback load failed:", error);
+    return null;
+  }
 }
 
 async function loadHandoff(input: LoadInput): Promise<LoadOutput> {
+  // Try filesystem fallback FIRST (always available)
+  const filesystemHandoff = await loadFromFilesystem(
+    input.session_id,
+    input.cycle_number
+  );
+
+  if (filesystemHandoff) {
+    const formattedContext = formatHandoffContext(filesystemHandoff);
+    return {
+      found: true,
+      handoff: filesystemHandoff,
+      formatted_context: formattedContext,
+      source: "filesystem",
+    };
+  }
+
+  // Fall back to Memorai if filesystem not available
   if (!databaseExists()) {
     return {
       found: false,
-      error: "Memorai database not found",
+      error: "No handoff found (filesystem empty, memorai not available)",
     };
   }
 
@@ -106,6 +200,7 @@ async function loadHandoff(input: LoadInput): Promise<LoadOutput> {
       found: true,
       handoff,
       formatted_context: formattedContext,
+      source: "memorai",
     };
   } catch (error) {
     return {

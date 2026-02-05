@@ -3,7 +3,7 @@
 Post-testing audit. 132 checks across 4 levels, 14 bugs fixed during testing.
 Items below are outstanding WARNs and feature ideas discovered during the session.
 
-Last updated: 2026-02-04
+Last updated: 2026-02-05
 
 ---
 
@@ -17,7 +17,7 @@ Last updated: 2026-02-04
 
 ## Bugs
 
-### [BUG-1] P1 -- Agent mode: dual error tracking gap
+### [BUG-1] P1 -- Agent mode: dual error tracking gap -- DONE
 
 `is_error` (from Claude's JSON response, line 735 of `ralph-loop.sh`) tracks API-level
 errors (timeouts, auth failures, rate limits). `ERROR_COUNT` (line 591) tracks
@@ -34,9 +34,13 @@ but does not increment `ERROR_COUNT`).
 **Fix:** Add `api_error_count` field to `status.json`, or unify by incrementing
 `ERROR_COUNT` when `IS_ERROR == "true"`.
 
+**Resolution:** Added `API_ERROR_COUNT` and `LAST_API_ERROR` tracking variables.
+Updated `update_status_json` to include `api_error_count` and `last_api_error` fields.
+Added API error tracking logic that increments counter when `IS_ERROR == "true"`.
+
 ---
 
-### [BUG-2] P2 -- Agent mode: raw promise tag leaks into summary
+### [BUG-2] P2 -- Agent mode: raw promise tag leaks into summary -- DONE
 
 When an iteration contains `<promise>TASK_COMPLETE</promise>` but no `[STATUS]` line,
 the fallback summary extraction (line 768) picks up the last non-empty line, which may
@@ -50,9 +54,12 @@ be the raw XML tag itself. The summary then reads something like
 **Fix:** Strip `<promise>...</promise>` tags before fallback summary extraction, or
 use the line before the promise tag.
 
+**Resolution:** Added `grep -v '<promise>.*</promise>'` to filter out promise tags
+before selecting the last non-empty line for the summary.
+
 ---
 
-### [BUG-3] P1 -- Token counting underreports input tokens
+### [BUG-3] P1 -- Token counting underreports input tokens -- DONE
 
 `total_input_tokens` in `status.json` reads only `usage.input_tokens` (line 737).
 It does not include `cache_creation_input_tokens` or `cache_read_input_tokens`.
@@ -71,11 +78,14 @@ The `total_cost_usd` field is accurate because it comes directly from Claude's
 **Fix:** Sum all three token fields in the bash loop:
 `ITER_INPUT=$(jq -r '(.usage.input_tokens // 0) + (.usage.cache_creation_input_tokens // 0) + (.usage.cache_read_input_tokens // 0)' ...)`.
 
+**Resolution:** Updated `ITER_INPUT` calculation to sum all three token fields
+(`input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`).
+
 ---
 
 ## Robustness
 
-### [ROB-1] P1 -- Supervisor mode: no warning when intelligence layer missing
+### [ROB-1] P1 -- Supervisor mode: no warning when intelligence layer missing -- DONE
 
 If `--supervisor` is passed but `bun`/`scripts/` are unavailable, the script silently
 falls back to basic single-loop mode. The supervisor features (context cycling,
@@ -87,6 +97,9 @@ handoff, multi-cycle) are completely disabled without any indication to the user
 **Fix:** Emit a warning (stderr in human mode, status line in agent mode) when
 `--supervisor` is passed but `INTELLIGENCE_AVAILABLE == false`. Something like:
 `WARNING: --supervisor requires bun + scripts/ -- falling back to basic mode`.
+
+**Resolution:** Added warning check after argument parsing. In agent mode, emits
+`[WARN]` prefixed message. In human mode, emits yellow-formatted warning to stderr.
 
 ---
 
@@ -108,7 +121,7 @@ to `.ralph-loop/handoff-cycle-N.json`) when memorai is unavailable.
 
 ---
 
-### [ROB-3] P1 -- Nudge race condition (theoretical)
+### [ROB-3] P1 -- Nudge race condition (theoretical) -- DONE
 
 `read_and_consume_nudge()` (line 257-263) reads the nudge file with `cat`, then deletes
 it with `rm -f`. If a new nudge is written between the `cat` and `rm`, the new nudge
@@ -120,9 +133,13 @@ is silently lost.
 
 **Fix:** Use atomic consumption: `mv nudge.md nudge.consumed.md && cat nudge.consumed.md && rm -f nudge.consumed.md`. The `mv` is atomic on the same filesystem, so a concurrent write creates a new `nudge.md` that is preserved.
 
+**Resolution:** Implemented atomic consumption pattern with `mv` before `cat`.
+The function now atomically renames the nudge file before reading, preventing
+race conditions.
+
 ---
 
-### [ROB-4] P1 -- Child process cleanup on SIGINT/SIGTERM
+### [ROB-4] P1 -- Child process cleanup on SIGINT/SIGTERM -- DONE
 
 `handle_interrupt` (line 624-639) generates a summary and writes status, but does not
 explicitly kill child processes. If `claude` CLI is mid-execution when the signal
@@ -142,9 +159,13 @@ wait $CLAUDE_PID
 [[ -n "$CLAUDE_PID" ]] && kill "$CLAUDE_PID" 2>/dev/null
 ```
 
+**Resolution:** Added `CLAUDE_PID` global variable. Updated agent mode execution to
+run claude in background and track PID. Updated `handle_interrupt` to kill child
+process before cleanup.
+
 ---
 
-### [ROB-5] P2 -- Nudge not consumed in basic mode
+### [ROB-5] P2 -- Nudge not consumed in basic mode -- DONE
 
 The nudge system (`--nudge` flag, `read_and_consume_nudge()`) is tightly coupled to
 the intelligence layer. In basic mode (no bun/scripts), nudges are written to
@@ -159,6 +180,10 @@ the intelligence layer. In basic mode (no bun/scripts), nudges are written to
 **Fix:** Read and inject nudge content in the basic prompt builder too. Add nudge
 consumption before the `if [[ "$INTELLIGENCE_AVAILABLE" == true ]]` block, and append
 nudge text to the basic prompt if present.
+
+**Resolution:** Moved nudge reading before the intelligence check. Added nudge
+injection at the end of `build_prompt()` for basic mode with "## Nudge from User"
+section header.
 
 ---
 
@@ -180,7 +205,7 @@ mode for non-interactive contexts.
 
 ## Features
 
-### [FEAT-1] P2 -- `--dry-run` flag for testing
+### [FEAT-1] P2 -- `--dry-run` flag for testing -- DONE
 
 Add a `--dry-run` flag that goes through all prompt building, strategy selection, and
 context construction steps but does not actually invoke `claude`. Useful for testing
@@ -188,6 +213,10 @@ prompt content, validating the intelligence pipeline, and debugging.
 
 **Where:** New flag in argument parsing (line 111-186). Skip `claude` invocation in
 `run_inner_loop()`.
+
+**Resolution:** Added `--dry-run` flag, `DRY_RUN` variable, `print_dry_run_info()`
+function that displays Claude arguments, strategy, prompt content, and JSON data.
+Banner shows "DRY RUN" mode indicator.
 
 ---
 
@@ -205,7 +234,7 @@ flag like `--structured-human` or auto-detected when no TTY is present.
 
 ---
 
-### [FEAT-3] P2 -- `--no-intelligence` flag
+### [FEAT-3] P2 -- `--no-intelligence` flag -- DONE
 
 Explicitly disable the intelligence layer even when bun/scripts are available. Useful
 for debugging, benchmarking basic vs. intelligent mode, or when the intelligence layer
@@ -214,9 +243,13 @@ is misbehaving.
 **Where:** New flag in argument parsing. Set `INTELLIGENCE_AVAILABLE=false` after
 detection (line 58-60).
 
+**Resolution:** Added `--no-intelligence` flag with `NO_INTELLIGENCE_FLAG` tracking
+variable. Override logic sets `INTELLIGENCE_AVAILABLE=false` after argument parsing
+when flag is present.
+
 ---
 
-### [FEAT-4] P1 -- Unify error tracking in status.json
+### [FEAT-4] P1 -- Unify error tracking in status.json -- DONE
 
 Add an `api_errors` or `api_error_count` field to `status.json` alongside the existing
 `error_count` (transcript-analysis errors). Alternatively, add a `last_api_error` field
@@ -227,9 +260,12 @@ Related to BUG-1.
 **Where:** `ralph-loop.sh:525-576` (`update_status_json`), `ralph-loop.sh:755`
 (error detection branch).
 
+**Resolution:** Implemented as part of BUG-1 fix. Added both `api_error_count` and
+`last_api_error` fields to status.json.
+
 ---
 
-### [FEAT-5] P1 -- Signal forwarding to child processes
+### [FEAT-5] P1 -- Signal forwarding to child processes -- DONE
 
 Forward SIGINT/SIGTERM to the active `claude` child process before cleanup. This
 ensures Claude can handle graceful shutdown (e.g., saving partial work) rather than
@@ -239,18 +275,23 @@ Related to ROB-4.
 
 **Where:** `ralph-loop.sh:624-639` (`handle_interrupt`).
 
+**Resolution:** Implemented as part of ROB-4 fix. Child process is killed in
+`handle_interrupt` before cleanup proceeds.
+
 ---
 
-### [FEAT-6] P2 -- Atomic nudge consumption
+### [FEAT-6] P2 -- Atomic nudge consumption -- DONE
 
 Replace the current `cat + rm` nudge consumption with `mv + cat + rm` for atomicity.
 Prevents the theoretical race condition in ROB-3.
 
 **Where:** `ralph-loop.sh:257-263` (`read_and_consume_nudge`).
 
+**Resolution:** Implemented as part of ROB-3 fix.
+
 ---
 
-### [FEAT-7] P2 -- Basic nudge support (no intelligence layer)
+### [FEAT-7] P2 -- Basic nudge support (no intelligence layer) -- DONE
 
 Read and inject nudge content in the basic prompt builder so nudges work even without
 bun/scripts. The nudge is already written to disk by the `--nudge` flag handler
@@ -260,9 +301,11 @@ Related to ROB-5.
 
 **Where:** `ralph-loop.sh:420-522` (`build_prompt`).
 
+**Resolution:** Implemented as part of ROB-5 fix.
+
 ---
 
-### [FEAT-8] P2 -- Supervisor mode intelligence warning
+### [FEAT-8] P2 -- Supervisor mode intelligence warning -- DONE
 
 When `--supervisor` is passed but the intelligence layer is unavailable, emit a visible
 warning. Currently falls through silently to basic single-loop mode.
@@ -270,6 +313,8 @@ warning. Currently falls through silently to basic single-loop mode.
 Related to ROB-1.
 
 **Where:** After argument parsing, before main execution (around line 845).
+
+**Resolution:** Implemented as part of ROB-1 fix.
 
 ---
 
@@ -287,13 +332,16 @@ in a CHANGELOG or release notes.
 
 ---
 
-### [DOC-2] P2 -- Document token counting discrepancy
+### [DOC-2] P2 -- Document token counting discrepancy -- DONE (code fixed)
 
 Explain in README.md that `total_input_tokens` in `status.json` underreports because
 it only counts `usage.input_tokens`, not cache tokens. Clarify that `total_cost_usd`
 is accurate. Reference BUG-3 for the fix.
 
 **Where:** `README.md`, Agent Mode section.
+
+**Note:** The underlying BUG-3 has been fixed, so token counting is now accurate.
+Documentation may still be useful to explain what the token fields include.
 
 ---
 
@@ -311,6 +359,19 @@ or non-interactive contexts. Recommend `--agent` mode for those use cases.
 | Priority | Bugs | Robustness | Features | Documentation | Total |
 |----------|------|------------|----------|---------------|-------|
 | P0       | 0    | 0          | 0        | 0             | 0     |
-| P1       | 2    | 3          | 2        | 0             | 7     |
-| P2       | 1    | 3          | 6        | 3             | 13    |
-| **Total**| **3**| **6**      | **8**    | **3**         | **20**|
+| P1       | 0 (2 done) | 0 (3 done) | 0 (2 done) | 0         | 0 (7 done) |
+| P2       | 0 (1 done) | 2 (1 done) | 1 (5 done) | 2 (1 code fix) | 5 remaining |
+| **Total**| **0**| **2**      | **1**    | **2**         | **5 remaining**|
+
+### Completed (15 items)
+- BUG-1, BUG-2, BUG-3
+- ROB-1, ROB-3, ROB-4, ROB-5
+- FEAT-1, FEAT-3, FEAT-4, FEAT-5, FEAT-6, FEAT-7, FEAT-8
+- DOC-2 (code fix only)
+
+### Remaining (5 items)
+- ROB-2: Filesystem fallback for handoff without memorai
+- ROB-6: Human mode TTY requirement
+- FEAT-2: Stream-json for human mode
+- DOC-1: Document --continue fix
+- DOC-3: Document TTY limitation
